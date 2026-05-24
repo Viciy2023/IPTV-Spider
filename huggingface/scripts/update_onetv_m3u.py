@@ -103,6 +103,7 @@ class Entry:
     extinf: str
     url: str
     group: str
+    group_priority: int = 1
 
 
 def log(message: str) -> None:
@@ -204,7 +205,10 @@ def merge_migu_playlist(base_text: str, migu_text: str) -> str:
             continue
         normalized_name = normalize_migu_channel(raw_name)
         target_group = map_migu_group(entry.group, normalized_name)
-        normalized_entry = Entry(replace_entry_metadata(entry.extinf, target_group, normalized_name), entry.url, target_group)
+        group_priority = 0 if entry.group == "超清频道" and target_group == "卫视频道" else 1
+        normalized_entry = Entry(
+            replace_entry_metadata(entry.extinf, target_group, normalized_name), entry.url, target_group, group_priority
+        )
         dedupe_key = (target_group, normalized_name, entry.url)
         if dedupe_key in seen:
             continue
@@ -230,7 +234,7 @@ def merge_migu_playlist(base_text: str, migu_text: str) -> str:
         output_entries.extend(entries)
 
     group_rank = {group: index for index, group in enumerate(FINAL_GROUP_ORDER)}
-    output_entries.sort(key=lambda entry: group_rank.get(entry.group, len(group_rank)))
+    output_entries.sort(key=lambda entry: (group_rank.get(entry.group, len(group_rank)), entry.group_priority))
 
     output = [header]
     for entry in output_entries:
