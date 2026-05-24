@@ -174,6 +174,11 @@ def map_migu_group(source_group: str, normalized_name: str) -> str:
     return source_group
 
 
+def is_onetv_update_entry(entry: Entry) -> bool:
+    name = entry_name(entry.extinf)
+    return entry.group == "公众号【壹来了】" and (name.startswith("ONETV更新日期:") or name.startswith("MIGU更新日期:"))
+
+
 def merge_migu_playlist(base_text: str, migu_text: str) -> str:
     header, base_entries = parse_m3u(base_text)
     _, migu_entries = parse_m3u(migu_text)
@@ -211,6 +216,8 @@ def merge_migu_playlist(base_text: str, migu_text: str) -> str:
         )
 
     for entry in base_entries:
+        if is_onetv_update_entry(entry):
+            continue
         key = (entry.group, normalize_migu_channel(entry_name(entry.extinf)))
         output_entries.extend(migu_by_key.pop(key, []))
         output_entries.append(entry)
