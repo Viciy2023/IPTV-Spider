@@ -56,7 +56,8 @@ SOURCE_GROUPS = {
 }
 
 UPDATE_PLACEHOLDER_URL = "https://proshls.wns.live/hls/stream.m3u8"
-MIGU_LOGO_BASE_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv/"
+MIGU_LOGO_BASE_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv"
+ONETV_UPDATE_LOGO_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv/CCTV13.png"
 
 MIGU_REGIONAL_GROUPS = {
     "浙江地区": "浙江频道",
@@ -150,6 +151,11 @@ def replace_entry_metadata(extinf: str, group: str, name: str, logo_name: Option
     return f'#EXTINF:-1 group-title="{group}" tvg-logo="{MIGU_LOGO_BASE_URL}/{logo}.png",{name}'
 
 
+def onetv_update_entry(group: str, update_name: str, cctv13_url: str) -> Entry:
+    extinf = f'#EXTINF:-1 group-title="{group}" tvg-logo="{ONETV_UPDATE_LOGO_URL}",{update_name}'
+    return Entry(extinf, cctv13_url, group)
+
+
 def normalize_migu_channel(name: str) -> str:
     normalized = name.strip()
     if normalized.startswith("CCTV"):
@@ -176,7 +182,9 @@ def map_migu_group(source_group: str, normalized_name: str) -> str:
 
 def is_onetv_update_entry(entry: Entry) -> bool:
     name = entry_name(entry.extinf)
-    return entry.group == "公众号【壹来了】" and (name.startswith("ONETV更新日期:") or name.startswith("MIGU更新日期:"))
+    return entry.group in {"🕘️更新时间", "公众号【壹来了】"} and (
+        name.startswith("ONETV更新日期:") or name.startswith("MIGU更新日期:") or entry.url == UPDATE_PLACEHOLDER_URL
+    )
 
 
 def merge_migu_playlist(base_text: str, migu_text: str) -> str:
@@ -207,13 +215,9 @@ def merge_migu_playlist(base_text: str, migu_text: str) -> str:
 
     output_entries: list[Entry] = []
     if update_date and cctv13_url:
-        output_entries.append(
-            Entry(
-                replace_entry_metadata("", "公众号【壹来了】", f"ONETV更新日期: {update_date}", "CCTV13"),
-                cctv13_url,
-                "公众号【壹来了】",
-            )
-        )
+        update_name = f"ONETV更新日期: {update_date}"
+        for group in ("🕘️更新时间", "公众号【壹来了】"):
+            output_entries.append(onetv_update_entry(group, update_name, cctv13_url))
 
     for entry in base_entries:
         if is_onetv_update_entry(entry):
