@@ -56,7 +56,7 @@ SOURCE_GROUPS = {
 }
 
 UPDATE_PLACEHOLDER_URL = "https://proshls.wns.live/hls/stream.m3u8"
-MIGU_LOGO_BASE_URL = "https://live.fanmingming.cn/tv"
+MIGU_LOGO_BASE_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv/"
 
 MIGU_REGIONAL_GROUPS = {
     "浙江地区": "浙江频道",
