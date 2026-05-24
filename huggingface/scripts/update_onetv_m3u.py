@@ -399,6 +399,9 @@ def run_once(db_path: Path, m3u_path: Path, base_url: str) -> None:
             merged = merge_migu_playlist(merged, migu_playlist)
         except Exception as exc:
             log(f"MIGU merge skipped: {exc}")
+    if merged == base_playlist:
+        log(f"M3U unchanged; upload skipped: {m3u_path}")
+        return
     backup = backup_file(m3u_path)
     log(f"backup created: {backup}")
     deleted_backups = cleanup_old_backups(m3u_path)
