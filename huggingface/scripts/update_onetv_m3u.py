@@ -264,18 +264,26 @@ def merge_playlists(base_text: str, source_text: str, updated_at: str) -> str:
 
 def find_latest_guangdong_ip_port(db_path: Path) -> str:
     query = """
-        SELECT ip_port, source_type, province_cn, created_at, id
+        SELECT ip_port, source_type, province_cn, created_at, id, status, failure_count
         FROM iptv
-        WHERE province_cn = ? OR source_type LIKE ?
+        WHERE (province_cn = ? OR source_type LIKE ?)
+          AND type = ?
+          AND COALESCE(status, '') NOT LIKE ?
         ORDER BY created_at DESC, id DESC
         LIMIT 1
     """
-    with sqlite3.connect(str(db_path)) as conn:
-        row = conn.execute(query, ("广东", "%广东%")).fetchone()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(query, ("广东", "%广东%", "multicast", "%失效%")).fetchone()
+    finally:
+        conn.close()
     if not row:
-        raise RuntimeError("no Guangdong multicast record found in iptv.db")
+        raise RuntimeError("no available Guangdong multicast record found in iptv.db")
     ip_port = row[0]
-    log(f"selected Guangdong multicast: ip_port={ip_port}, source_type={row[1]}, created_at={row[3]}, id={row[4]}")
+    log(
+        f"selected Guangdong multicast: ip_port={ip_port}, source_type={row[1]}, "
+        f"created_at={row[3]}, id={row[4]}, status={row[5]}, failure_count={row[6]}"
+    )
     return ip_port
 
 
