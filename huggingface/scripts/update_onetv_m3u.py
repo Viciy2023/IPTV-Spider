@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import datetime as dt
+import json
 import os
 import shutil
 import sqlite3
@@ -21,6 +22,10 @@ DEFAULT_INTERNAL_BASE_URL = "http://127.0.0.1:50085"  # IPTV-Spider 内部接口
 DEFAULT_INTERVAL_SECONDS = 3 * 60  # 测试阶段监控模式下检查数据库变化的默认间隔：3 分钟，单位是秒。
 DEFAULT_SETTLE_SECONDS = 10  # 发现数据库变更后先等待 10 秒，避免数据库还没写完就开始读取。
 DEFAULT_BACKUP_RETENTION_SECONDS = 1 * 60 * 60  # M3U 备份文件默认保留 1 小时，超过后会被清理。
+DEFAULT_CONFIG_PATH = "/data/config.json"  # IPTV-Spider 的运行配置，用来读取自动采集时间表。
+DEFAULT_DB_STABLE_TIMEOUT_SECONDS = 10 * 60  # 采集可能持续数分钟，最多等待 10 分钟让数据库写入稳定。
+DEFAULT_SCHEDULE_WINDOW_MINUTES = 30  # 定时采集开始后等待一个窗口，窗口结束补做一次同步检查。
+DEFAULT_MIGU_CHECK_INTERVAL_SECONDS = 30 * 60  # MIGU TXT 独立更新时，最多 30 分钟检查一次更新时间。
 MIGU_SOURCE_URL = "https://raw.githubusercontent.com/develop202/migu_video/refs/heads/main/interface.txt"
 
 KEEP_GROUPS = {
@@ -145,6 +150,84 @@ def rename_source_group(extinf: str, group: str) -> str:
 
 def entry_name(extinf: str) -> str:
     return extinf.rsplit(",", 1)[-1].strip() if "," in extinf else ""
+
+
+def extract_migu_update_date(text: str) -> str:
+    _, entries = parse_m3u(text)
+    for entry in entries:
+        name = entry_name(entry.extinf)
+        if name.startswith("更新日期:"):
+            return name.removeprefix("更新日期:").strip()
+    return ""
+
+
+def extract_onetv_update_date(text: str) -> str:
+    _, entries = parse_m3u(text)
+    for entry in entries:
+        name = entry_name(entry.extinf)
+        if name.startswith("ONETV更新日期:"):
+            return name.removeprefix("ONETV更新日期:").strip()
+    return ""
+
+
+def has_migu_update_changed(current_text: str, migu_text: str) -> bool:
+    remote_update_date = extract_migu_update_date(migu_text)
+    current_update_date = extract_onetv_update_date(current_text)
+    return bool(remote_update_date and remote_update_date != current_update_date)
+
+
+def load_auto_schedules(config_path: Path) -> list[str]:
+    if not config_path.exists():
+        return []
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log(f"load config skipped: {exc}")
+        return []
+    schedules = data.get("auto_schedules", [])
+    if not isinstance(schedules, list):
+        return []
+    return [item for item in schedules if isinstance(item, str) and item]
+
+
+def due_schedule_checks(now: dt.datetime, schedules: list[str], window_minutes: int, checked: set[str]) -> list[str]:
+    due: list[str] = []
+    for schedule in schedules:
+        try:
+            hour_text, minute_text = schedule.split(":", 1)
+            scheduled_at = now.replace(hour=int(hour_text), minute=int(minute_text), second=0, microsecond=0)
+        except ValueError:
+            continue
+        key = scheduled_at.strftime("%Y-%m-%d %H:%M")
+        if key in checked:
+            continue
+        # 定时采集通常需要几分钟完成；窗口结束后补一次检查，兜住采集期间未落到最终状态的情况。
+        if scheduled_at + dt.timedelta(minutes=window_minutes) <= now:
+            due.append(key)
+    return due
+
+
+def is_migu_check_due(now: dt.datetime, last_check: Optional[dt.datetime], interval_seconds: int) -> bool:
+    return last_check is None or (now - last_check).total_seconds() >= interval_seconds
+
+
+def check_migu_and_sync(db_path: Path, m3u_path: Path, base_url: str, migu_url: str = MIGU_SOURCE_URL) -> bool:
+    if not m3u_path.exists():
+        return False
+    try:
+        current_text = m3u_path.read_text(encoding="utf-8")
+        migu_text = fetch_text(migu_url)
+    except Exception as exc:
+        log(f"MIGU update check skipped: {exc}")
+        return False
+    remote_update_date = extract_migu_update_date(migu_text)
+    current_update_date = extract_onetv_update_date(current_text)
+    log(f"MIGU update date: remote={remote_update_date or '-'}, current={current_update_date or '-'}")
+    if has_migu_update_changed(current_text, migu_text):
+        log("MIGU update date changed; starting sync")
+        run_once(db_path, m3u_path, base_url)
+        return True
+    return False
 
 
 def replace_entry_metadata(extinf: str, group: str, name: str, logo_name: Optional[str] = None) -> str:
@@ -347,6 +430,20 @@ def cleanup_old_backups(path: Path, retention_seconds: int = DEFAULT_BACKUP_RETE
     return deleted
 
 
+def wait_for_stable_db_mtime(db_path: Path, stable_seconds: int, timeout_seconds: int) -> float:
+    # 手动/定时采集会持续写库；这里等到 mtime 连续两次一致，再读取最终状态，避免采集中途生成半成品 M3U。
+    waited = 0
+    last_mtime = db_path.stat().st_mtime
+    while waited < timeout_seconds:
+        time.sleep(stable_seconds)
+        waited += stable_seconds
+        current_mtime = db_path.stat().st_mtime
+        if current_mtime == last_mtime:
+            return current_mtime
+        last_mtime = current_mtime
+    return last_mtime
+
+
 def upload_to_supabase(file_path: Path) -> bool:
     supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
     service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -398,7 +495,9 @@ def run_once(db_path: Path, m3u_path: Path, base_url: str) -> None:
             migu_playlist = fetch_text(MIGU_SOURCE_URL)
             merged = merge_migu_playlist(merged, migu_playlist)
         except Exception as exc:
-            log(f"MIGU merge skipped: {exc}")
+            # MIGU 是最终 M3U 的核心来源之一。拉取失败时保留旧文件，避免把已合并的好文件降级成纯组播版本。
+            log(f"MIGU merge failed; update skipped to preserve current M3U: {exc}")
+            return
     if merged == base_playlist:
         log(f"M3U unchanged; upload skipped: {m3u_path}")
         return
@@ -412,23 +511,54 @@ def run_once(db_path: Path, m3u_path: Path, base_url: str) -> None:
     upload_to_supabase(m3u_path)
 
 
-def watch(db_path: Path, m3u_path: Path, base_url: str, interval_seconds: int, settle_seconds: int) -> None:
+def watch(
+    db_path: Path,
+    m3u_path: Path,
+    base_url: str,
+    interval_seconds: int,
+    settle_seconds: int,
+    config_path: Path = Path(DEFAULT_CONFIG_PATH),
+) -> None:
     last_mtime = db_path.stat().st_mtime if db_path.exists() else None
     log(f"watching db={db_path}, m3u={m3u_path}, interval={interval_seconds}s")
+    auto_schedules = load_auto_schedules(config_path)
+    if auto_schedules:
+        log(f"loaded auto schedules: {','.join(auto_schedules)}")
+    checked_schedules: set[str] = set()
+    last_migu_check: Optional[dt.datetime] = None
+    try:
+        log("startup sync check")
+        run_once(db_path, m3u_path, base_url)
+        last_migu_check = dt.datetime.now()
+    except Exception as exc:
+        log(f"startup update failed; original M3U preserved: {exc}")
     while True:
         time.sleep(interval_seconds)
         if not db_path.exists():
             log(f"database not found: {db_path}")
             continue
+        should_sync = False
         current_mtime = db_path.stat().st_mtime
         if last_mtime is None or current_mtime != last_mtime:
             log("database mtime changed; waiting for writes to settle")
-            time.sleep(settle_seconds)
+            current_mtime = wait_for_stable_db_mtime(db_path, settle_seconds, DEFAULT_DB_STABLE_TIMEOUT_SECONDS)
+            should_sync = True
+        now = dt.datetime.now()
+        due_schedules = due_schedule_checks(now, auto_schedules, DEFAULT_SCHEDULE_WINDOW_MINUTES, checked_schedules)
+        if due_schedules:
+            log(f"schedule window finished; sync check: {','.join(due_schedules)}")
+            checked_schedules.update(due_schedules)
+            should_sync = True
+        if should_sync:
             try:
                 run_once(db_path, m3u_path, base_url)
                 last_mtime = current_mtime
             except Exception as exc:
                 log(f"update failed; original M3U preserved: {exc}")
+            continue
+        if is_migu_check_due(now, last_migu_check, DEFAULT_MIGU_CHECK_INTERVAL_SECONDS):
+            check_migu_and_sync(db_path, m3u_path, base_url)
+            last_migu_check = now
 
 
 def parse_args() -> argparse.Namespace:
@@ -450,7 +580,7 @@ def main() -> int:
         if args.once:
             run_once(db_path, m3u_path, args.base_url)
         else:
-            watch(db_path, m3u_path, args.base_url, args.interval, args.settle)
+            watch(db_path, m3u_path, args.base_url, args.interval, args.settle, Path(DEFAULT_CONFIG_PATH))
         return 0
     except KeyboardInterrupt:
         log("stopped")
