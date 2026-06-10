@@ -16,3 +16,6 @@ haisinas/onetv_api_guangdong_multicast.m3u
 haisinas/iptv-spider-docker-migu-db-design.md
 haisinas/test_update_onetv_m3u_from_migu_db.py
 haisinas/onetv_api_guangdong_multicast (7).m3u
+haisinas/send_msg.php
+haisinas/test_wechat.py
+haisinas/wechat.conf
