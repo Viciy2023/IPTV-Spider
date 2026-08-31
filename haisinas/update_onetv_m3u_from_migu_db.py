@@ -25,7 +25,7 @@ DEFAULT_BACKUP_RETENTION_SECONDS = 1 * 60 * 60
 DEFAULT_MIGU_LIMIT = 5
 DEFAULT_FIXED_CHECK_INTERVAL_SECONDS = 30 * 60
 DEFAULT_WORLD_CUP_CHECK_INTERVAL_SECONDS = 5 * 60
-MIGU_SOURCE_URL = "https://gh-proxy.com/https://raw.githubusercontent.com/develop202/migu_video/refs/heads/main/interface.txt"
+MIGU_SOURCE_URL = "http://192.168.1.20:1234/zbpro/interface.txt"
 WORLD_CUP_SOURCE_URL = "http://82.156.243.185:33389/fwc.m3u"
 WORLD_CUP_EXCLUDE_GROUPS = {"注意事项"}
 WORLD_CUP_GROUP_NAME = "世界杯直播"
@@ -76,6 +76,7 @@ REPLACE_GROUPS = {
 }
 
 MIGU_REGIONAL_GROUPS = {
+    "广东地区": "广东频道",
     "浙江地区": "浙江频道",
     "江苏地区": "江苏频道",
     "黑龙江地区": "黑龙江频道",
@@ -353,19 +354,28 @@ def parse_m3u(text: str) -> tuple[str, list[Entry]]:
     return header, entries
 
 
+CCTV_SUFFIXES = ("新闻", "综合", "财经", "体育", "电影", "纪录", "科教", "少儿", "戏曲", "音乐", "农业农村", "国防军事")
+
+
 def normalize_channel(name: str) -> str:
     normalized = name.strip()
     if normalized.startswith("CCTV"):
         if normalized.startswith("CCTV5+"):
             return "CCTV5+"
         digits = ""
+        rest_after_digits = ""
         for char in normalized[4:]:
             if char.isdigit():
                 digits += char
             else:
+                rest_after_digits = normalized[4 + len(digits):]
                 break
         if digits:
-            return f"CCTV{digits}"
+            if not rest_after_digits:
+                return f"CCTV{digits}"
+            for suffix in CCTV_SUFFIXES:
+                if rest_after_digits == suffix:
+                    return f"CCTV{digits}"
     if normalized.endswith("4K"):
         normalized = normalized[:-2].strip()
     return normalized
@@ -530,7 +540,7 @@ def build_playlist(template_text: str, db_sources: list[MiguSource], fixed_text:
     output_entries.extend(fixed_entries)
     output_entries.extend(world_cup_entries)
     group_rank = {group: index for index, group in enumerate(FINAL_GROUP_ORDER)}
-    output_entries.sort(key=lambda entry: (group_rank.get(entry.group, len(group_rank)), entry.priority))
+    output_entries.sort(key=lambda entry: (group_rank.get(entry.group, len(group_rank)), entry.priority, 1 if "超清" in entry.name else 0))
     output = [header]
     for entry in output_entries:
         output.extend([entry.extinf, entry.url])
