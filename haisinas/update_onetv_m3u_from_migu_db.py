@@ -24,11 +24,11 @@ DEFAULT_DB_STABLE_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_BACKUP_RETENTION_SECONDS = 1 * 60 * 60
 DEFAULT_MIGU_LIMIT = 5
 DEFAULT_FIXED_CHECK_INTERVAL_SECONDS = 30 * 60
-DEFAULT_WORLD_CUP_CHECK_INTERVAL_SECONDS = 5 * 60
 MIGU_SOURCE_URL = "http://192.168.1.20:1234/zbpro/interface.txt"
-WORLD_CUP_SOURCE_URL = "http://82.156.243.185:33389/fwc.m3u"
-WORLD_CUP_EXCLUDE_GROUPS = {"注意事项"}
-WORLD_CUP_GROUP_NAME = "世界杯直播"
+WUDALIANSAI_SOURCE_URL = "http://192.168.1.20:18765/live.m3u"
+WUDALIANSAI_EXCLUDE_GROUPS = {"注意事项"}
+WUDALIANSAI_CHECK_INTERVAL_SECONDS = 90
+WUDALIANSAI_UPLOAD_INTERVAL_SECONDS = 10 * 60
 UPDATE_LOGO_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv/CCTV13.png"
 LOGO_BASE_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv"
 
@@ -252,7 +252,6 @@ FINAL_GROUP_ORDER = [
     "🕘️更新时间",
     "公众号【壹来了】",
     "央视频道",
-    "世界杯直播",
     "卫视频道",
     "广东频道",
     "浙江频道",
@@ -481,23 +480,32 @@ def entries_from_fixed_playlist(fixed_text: str) -> tuple[list[Entry], str, str]
     return entries, update_date, cctv13_url
 
 
-def entries_from_world_cup_source(world_cup_text: str) -> list[Entry]:
-    _, world_cup_entries = parse_m3u(world_cup_text)
+def entries_from_wudaliansai_source(wudaliansai_text: str) -> tuple[list[Entry], list[str]]:
+    _, wudaliansai_entries = parse_m3u(wudaliansai_text)
     entries: list[Entry] = []
-    seen: set[tuple[str, str, str]] = set()
-    for entry in world_cup_entries:
-        if entry.group in WORLD_CUP_EXCLUDE_GROUPS:
+    seen_groups: list[str] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for entry in wudaliansai_entries:
+        if entry.group in WUDALIANSAI_EXCLUDE_GROUPS:
             continue
-        normalized_name = entry.name.strip()
-        if not normalized_name:
+        if entry.group not in seen_groups:
+            seen_groups.append(entry.group)
+        key = (entry.group, entry.name, entry.url)
+        if key in seen_keys:
             continue
-        group = WORLD_CUP_GROUP_NAME
-        key = (group, normalized_name, entry.url)
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append(Entry(metadata(group, normalized_name), entry.url, group, normalized_name, 5))
-    return entries
+        seen_keys.add(key)
+        entries.append(Entry(entry.extinf, entry.url, entry.group, entry.name, 3))
+    return entries, seen_groups
+
+
+def build_final_group_order(wudaliansai_groups: list[str]) -> list[str]:
+    order = list(FINAL_GROUP_ORDER)
+    insert_index = order.index("央视频道")
+    for group in wudaliansai_groups:
+        if group not in order:
+            order.insert(insert_index, group)
+            insert_index += 1
+    return order
 
 
 def cctv13_update_entries(group: str, updated_at: str, dynamic_entries: list[Entry], fixed_entries: list[Entry]) -> list[Entry]:
@@ -524,11 +532,11 @@ def should_drop_template_entry(entry: Entry) -> bool:
     return False
 
 
-def build_playlist(template_text: str, db_sources: list[MiguSource], fixed_text: str, updated_at: str, world_cup_text: str = "") -> str:
+def build_playlist(template_text: str, db_sources: list[MiguSource], fixed_text: str, updated_at: str, wudaliansai_text: str = "") -> str:
     header, template_entries = parse_m3u(template_text)
     dynamic_entries = entries_from_db_sources(db_sources)
     fixed_entries, fixed_update_date, _cctv13_url = entries_from_fixed_playlist(fixed_text)
-    world_cup_entries = entries_from_world_cup_source(world_cup_text) if world_cup_text else []
+    wudaliansai_entries, wudaliansai_groups = entries_from_wudaliansai_source(wudaliansai_text) if wudaliansai_text else ([], [])
     output_entries: list[Entry] = []
     update_label = updated_at or fixed_update_date or dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     output_entries.extend(cctv13_update_entries("🕘️更新时间", update_label, dynamic_entries, fixed_entries))
@@ -538,8 +546,9 @@ def build_playlist(template_text: str, db_sources: list[MiguSource], fixed_text:
             output_entries.append(entry)
     output_entries.extend(dynamic_entries)
     output_entries.extend(fixed_entries)
-    output_entries.extend(world_cup_entries)
-    group_rank = {group: index for index, group in enumerate(FINAL_GROUP_ORDER)}
+    output_entries.extend(wudaliansai_entries)
+    final_order = build_final_group_order(wudaliansai_groups)
+    group_rank = {group: index for index, group in enumerate(final_order)}
     output_entries.sort(key=lambda entry: (group_rank.get(entry.group, len(group_rank)), entry.priority, 1 if "超清" in entry.name else 0))
     output = [header]
     for entry in output_entries:
@@ -627,7 +636,7 @@ def upload_to_supabase(file_path: Path) -> bool:
         raise RuntimeError(f"Supabase upload failed: HTTP {exc.code}: {body}") from exc
 
 
-def run_once(db_path: Path, m3u_path: Path, template_path: Path, migu_url: str = MIGU_SOURCE_URL, world_cup_text: str = "") -> bool:
+def run_once(db_path: Path, m3u_path: Path, template_path: Path, migu_url: str = MIGU_SOURCE_URL, wudaliansai_text: str = "") -> bool:
     if not db_path.exists():
         raise FileNotFoundError(f"database not found: {db_path}")
     if not template_path.exists():
@@ -642,7 +651,7 @@ def run_once(db_path: Path, m3u_path: Path, template_path: Path, migu_url: str =
         log(f"fixed MIGU fetch failed; update skipped to preserve current M3U: {exc}")
         return False
     updated_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    merged = build_playlist(template_text, sources, fixed_text, updated_at, world_cup_text)
+    merged = build_playlist(template_text, sources, fixed_text, updated_at, wudaliansai_text)
     if merged == current_text:
         log(f"M3U unchanged; upload skipped: {m3u_path}")
         return False
@@ -678,14 +687,16 @@ def watch(
     interval_seconds: int,
     settle_seconds: int,
     fixed_check_interval_seconds: int = DEFAULT_FIXED_CHECK_INTERVAL_SECONDS,
-    world_cup_check_interval_seconds: int = DEFAULT_WORLD_CUP_CHECK_INTERVAL_SECONDS,
+    wudaliansai_check_interval_seconds: int = WUDALIANSAI_CHECK_INTERVAL_SECONDS,
 ) -> None:
     last_mtime = db_path.stat().st_mtime if db_path.exists() else None
     last_fixed_hash: Optional[str] = None
     last_fixed_check: Optional[dt.datetime] = None
-    last_world_cup_hash: Optional[str] = None
-    last_world_cup_check: Optional[dt.datetime] = None
-    current_world_cup_text: str = ""
+    last_wudaliansai_hash: Optional[str] = None
+    last_wudaliansai_check: Optional[dt.datetime] = None
+    current_wudaliansai_text: str = ""
+    wudaliansai_pending_upload = False
+    wudaliansai_last_change: Optional[dt.datetime] = None
     log(f"watching db={db_path}, m3u={m3u_path}, template={template_path}, interval={interval_seconds}s")
     try:
         try:
@@ -694,14 +705,14 @@ def watch(
         except Exception as exc:
             log(f"fixed source baseline check skipped: {exc}")
         try:
-            world_cup_text = fetch_text(WORLD_CUP_SOURCE_URL, retries=2, timeout=15)
-            current_world_cup_text = world_cup_text
-            last_world_cup_hash = content_hash(world_cup_text)
-            last_world_cup_check = now()
-            log("world cup source baseline loaded")
+            wudaliansai_text = fetch_text(WUDALIANSAI_SOURCE_URL, retries=2, timeout=10)
+            current_wudaliansai_text = wudaliansai_text
+            last_wudaliansai_hash = content_hash(wudaliansai_text)
+            last_wudaliansai_check = now()
+            log("wudaliansai source baseline loaded")
         except Exception as exc:
-            log(f"world cup source baseline check skipped: {exc}")
-        run_once(db_path, m3u_path, template_path, world_cup_text=current_world_cup_text)
+            log(f"wudaliansai source baseline check skipped: {exc}")
+        run_once(db_path, m3u_path, template_path, wudaliansai_text=current_wudaliansai_text)
     except Exception as exc:
         log(f"startup update failed; original M3U preserved: {exc}")
     while True:
@@ -714,7 +725,7 @@ def watch(
             log("database mtime changed; waiting for writes to settle")
             current_mtime = wait_for_stable_db_mtime(db_path, settle_seconds, DEFAULT_DB_STABLE_TIMEOUT_SECONDS)
             try:
-                run_once(db_path, m3u_path, template_path, world_cup_text=current_world_cup_text)
+                run_once(db_path, m3u_path, template_path, wudaliansai_text=current_wudaliansai_text)
                 last_mtime = current_mtime
             except Exception as exc:
                 log(f"update failed; original M3U preserved: {exc}")
@@ -729,27 +740,37 @@ def watch(
                     last_fixed_hash = fixed_hash
                 elif fixed_hash != last_fixed_hash:
                     log("fixed MIGU source changed; starting sync")
-                    run_once(db_path, m3u_path, template_path, world_cup_text=current_world_cup_text)
+                    run_once(db_path, m3u_path, template_path, wudaliansai_text=current_wudaliansai_text)
                     last_fixed_hash = fixed_hash
             except Exception as exc:
                 log(f"fixed source change check skipped: {exc}")
-        if is_fixed_check_due(current_time, last_world_cup_check, world_cup_check_interval_seconds):
+        if is_fixed_check_due(current_time, last_wudaliansai_check, wudaliansai_check_interval_seconds):
             try:
-                world_cup_text = fetch_text(WORLD_CUP_SOURCE_URL, retries=2, timeout=15)
-                world_cup_hash = content_hash(world_cup_text)
-                last_world_cup_check = current_time
-                if last_world_cup_hash is None:
-                    log("world cup source baseline loaded (retry)")
-                    last_world_cup_hash = world_cup_hash
-                    current_world_cup_text = world_cup_text
-                    run_once(db_path, m3u_path, template_path, world_cup_text=current_world_cup_text)
-                elif world_cup_hash != last_world_cup_hash:
-                    log("world cup source changed; starting sync")
-                    current_world_cup_text = world_cup_text
-                    run_once(db_path, m3u_path, template_path, world_cup_text=current_world_cup_text)
-                    last_world_cup_hash = world_cup_hash
+                wudaliansai_text = fetch_text(WUDALIANSAI_SOURCE_URL, retries=2, timeout=10)
+                wudaliansai_hash = content_hash(wudaliansai_text)
+                last_wudaliansai_check = current_time
+                if last_wudaliansai_hash is None:
+                    last_wudaliansai_hash = wudaliansai_hash
+                    current_wudaliansai_text = wudaliansai_text
+                    run_once(db_path, m3u_path, template_path, wudaliansai_text=current_wudaliansai_text)
+                elif wudaliansai_hash != last_wudaliansai_hash:
+                    log("wudaliansai source changed; updating M3U")
+                    current_wudaliansai_text = wudaliansai_text
+                    run_once(db_path, m3u_path, template_path, wudaliansai_text=current_wudaliansai_text)
+                    last_wudaliansai_hash = wudaliansai_hash
+                    wudaliansai_pending_upload = True
+                    wudaliansai_last_change = current_time
             except Exception as exc:
-                log(f"world cup source change check skipped: {exc}")
+                log(f"wudaliansai source check skipped: {exc}")
+        if wudaliansai_pending_upload and wudaliansai_last_change is not None:
+            if (current_time - wudaliansai_last_change).total_seconds() >= WUDALIANSAI_UPLOAD_INTERVAL_SECONDS:
+                try:
+                    upload_to_supabase(m3u_path)
+                    log("wudaliansai delayed upload completed")
+                except Exception as exc:
+                    log(f"wudaliansai delayed upload failed: {exc}")
+                wudaliansai_pending_upload = False
+                wudaliansai_last_change = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -765,9 +786,9 @@ def parse_args() -> argparse.Namespace:
         default=int(os.getenv("FIXED_CHECK_INTERVAL_SECONDS", DEFAULT_FIXED_CHECK_INTERVAL_SECONDS)),
     )
     parser.add_argument(
-        "--world-cup-check-interval",
+        "--wudaliansai-check-interval",
         type=int,
-        default=int(os.getenv("WORLD_CUP_CHECK_INTERVAL_SECONDS", DEFAULT_WORLD_CUP_CHECK_INTERVAL_SECONDS)),
+        default=int(os.getenv("WUDALIANSAI_CHECK_INTERVAL_SECONDS", WUDALIANSAI_CHECK_INTERVAL_SECONDS)),
     )
     parser.add_argument("--once", action="store_true")
     return parser.parse_args()
@@ -782,7 +803,7 @@ def main() -> int:
         if args.once:
             run_once(db_path, m3u_path, template_path)
         else:
-            watch(db_path, m3u_path, template_path, args.interval, args.settle, args.fixed_check_interval, args.world_cup_check_interval)
+            watch(db_path, m3u_path, template_path, args.interval, args.settle, args.fixed_check_interval, args.wudaliansai_check_interval)
         return 0
     except KeyboardInterrupt:
         log("stopped")
