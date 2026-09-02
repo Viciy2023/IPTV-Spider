@@ -437,6 +437,9 @@ def load_latest_migu_sources(db_path: Path, limit: int = DEFAULT_MIGU_LIMIT) -> 
     return [MiguSource(row[0], row[1], row[2] or "", row[3] or "", row[4] or "", row[5] or "") for row in rows]
 
 
+EXCLUDE_CHANNELS = {"CHC动作电影"}
+
+
 def entries_from_db_sources(sources: list[MiguSource]) -> list[Entry]:
     entries: list[Entry] = []
     seen: set[tuple[str, str, str]] = set()
@@ -446,6 +449,8 @@ def entries_from_db_sources(sources: list[MiguSource]) -> list[Entry]:
                 continue
             raw_name, url = line.split(",", 1)
             normalized_name = normalize_channel(raw_name)
+            if normalized_name in EXCLUDE_CHANNELS:
+                continue
             group = infer_group(normalized_name)
             key = (group, normalized_name, url.strip())
             if key in seen:
