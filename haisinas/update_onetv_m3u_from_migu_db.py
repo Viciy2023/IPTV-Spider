@@ -2,6 +2,7 @@
 import argparse
 import datetime as dt
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -29,14 +30,24 @@ WUDALIANSAI_SOURCE_URL = "http://192.168.1.20:18765/live.m3u"
 WUDALIANSAI_EXCLUDE_GROUPS = {"注意事项"}
 WUDALIANSAI_CHECK_INTERVAL_SECONDS = 90
 WUDALIANSAI_UPLOAD_INTERVAL_SECONDS = 10 * 60
+LIVEPURER_CHECK_INTERVAL_SECONDS = 120
 UPDATE_LOGO_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv/CCTV13.png"
 LOGO_BASE_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv"
+
+LIVEPURER_API_BASE = os.getenv("LIVEPURER_API_BASE", "http://172.17.0.1:8808")
+LIVEPURER_CHANNELS = {
+    "660000": "虎牙英雄联盟赛事",
+    "660002": "虎牙王者荣耀赛事",
+    "152792": "虎牙CS2赛事",
+}
+LIVEPURER_LOGO_URL = "https://raw.githubusercontent.com/fanmingming/live/main/tv/huya.png"
 
 KEEP_GROUPS = {
     "🕘️更新时间",
     "公众号【壹来了】",
     "国际频道",
     "电竞频道",
+    "虎牙频道",
     "体育频道",
     "香港频道",
     "澳门频道",
@@ -282,6 +293,7 @@ FINAL_GROUP_ORDER = [
     "中数传媒",
     "国际频道",
     "电竞频道",
+    "虎牙频道",
     "香港频道",
     "澳门频道",
     "台湾频道",
@@ -503,6 +515,42 @@ def entries_from_wudaliansai_source(wudaliansai_text: str) -> tuple[list[Entry],
     return entries, seen_groups
 
 
+def fetch_livepurer_channels() -> list[Entry]:
+    entries: list[Entry] = []
+    for room_id, channel_name in LIVEPURER_CHANNELS.items():
+        try:
+            info_url = f"{LIVEPURER_API_BASE}/api/v1/live/room_info?plat=huya&room={room_id}"
+            with urllib.request.urlopen(info_url, timeout=10) as resp:
+                info = json.loads(resp.read().decode("utf-8"))
+            if info.get("code") != 0 or not info.get("data"):
+                log(f"livepurer room_info failed for {room_id}: {info.get('msg', 'unknown')}")
+                continue
+            room_data = info["data"]
+            status = room_data.get("status", 0)
+            title = room_data.get("title", channel_name)
+            upper = room_data.get("upper", "")
+            if status != 1:
+                log(f"livepurer room {room_id} ({channel_name}) is offline, skipping")
+                continue
+            play_url = f"{LIVEPURER_API_BASE}/api/v1/live/play_url?plat=huya&room={room_id}"
+            with urllib.request.urlopen(play_url, timeout=10) as resp:
+                play_data = json.loads(resp.read().decode("utf-8"))
+            if play_data.get("code") != 0 or not play_data.get("data"):
+                log(f"livepurer play_url failed for {room_id}: {play_data.get('msg', 'unknown')}")
+                continue
+            stream_url = play_data["data"].get("origin", "")
+            if not stream_url:
+                log(f"livepurer no stream URL for {room_id}")
+                continue
+            display_name = f"{channel_name} {title}" if title and title != channel_name else channel_name
+            extinf = f'#EXTINF:-1 tvg-id="{channel_name}" tvg-name="{channel_name}" tvg-logo="{LIVEPURER_LOGO_URL}" group-title="虎牙频道",{display_name}'
+            entries.append(Entry(extinf, stream_url, "虎牙频道", channel_name, 2))
+            log(f"livepurer added: {channel_name} ({title})")
+        except Exception as exc:
+            log(f"livepurer fetch failed for {room_id} ({channel_name}): {exc}")
+    return entries
+
+
 def build_final_group_order(wudaliansai_groups: list[str]) -> list[str]:
     order = list(FINAL_GROUP_ORDER)
     insert_index = order.index("央视频道")
@@ -537,11 +585,13 @@ def should_drop_template_entry(entry: Entry) -> bool:
     return False
 
 
-def build_playlist(template_text: str, db_sources: list[MiguSource], fixed_text: str, updated_at: str, wudaliansai_text: str = "") -> str:
+def build_playlist(template_text: str, db_sources: list[MiguSource], fixed_text: str, updated_at: str, wudaliansai_text: str = "", livepurer_entries: Optional[list[Entry]] = None) -> str:
     header, template_entries = parse_m3u(template_text)
     dynamic_entries = entries_from_db_sources(db_sources)
     fixed_entries, fixed_update_date, _cctv13_url = entries_from_fixed_playlist(fixed_text)
     wudaliansai_entries, wudaliansai_groups = entries_from_wudaliansai_source(wudaliansai_text) if wudaliansai_text else ([], [])
+    if livepurer_entries is None:
+        livepurer_entries = []
     output_entries: list[Entry] = []
     update_label = updated_at or fixed_update_date or dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     output_entries.extend(cctv13_update_entries("🕘️更新时间", update_label, dynamic_entries, fixed_entries))
@@ -552,6 +602,7 @@ def build_playlist(template_text: str, db_sources: list[MiguSource], fixed_text:
     output_entries.extend(dynamic_entries)
     output_entries.extend(fixed_entries)
     output_entries.extend(wudaliansai_entries)
+    output_entries.extend(livepurer_entries)
     final_order = build_final_group_order(wudaliansai_groups)
     group_rank = {group: index for index, group in enumerate(final_order)}
     output_entries.sort(key=lambda entry: (group_rank.get(entry.group, len(group_rank)), entry.priority, 1 if "超清" in entry.name else 0))
@@ -641,7 +692,7 @@ def upload_to_supabase(file_path: Path) -> bool:
         raise RuntimeError(f"Supabase upload failed: HTTP {exc.code}: {body}") from exc
 
 
-def run_once(db_path: Path, m3u_path: Path, template_path: Path, migu_url: str = MIGU_SOURCE_URL, wudaliansai_text: str = "") -> bool:
+def run_once(db_path: Path, m3u_path: Path, template_path: Path, migu_url: str = MIGU_SOURCE_URL, wudaliansai_text: str = "", livepurer_entries: Optional[list[Entry]] = None) -> bool:
     if not db_path.exists():
         raise FileNotFoundError(f"database not found: {db_path}")
     if not template_path.exists():
@@ -656,7 +707,14 @@ def run_once(db_path: Path, m3u_path: Path, template_path: Path, migu_url: str =
         log(f"fixed MIGU fetch failed; update skipped to preserve current M3U: {exc}")
         return False
     updated_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    merged = build_playlist(template_text, sources, fixed_text, updated_at, wudaliansai_text)
+    if livepurer_entries is None:
+        try:
+            livepurer_entries = fetch_livepurer_channels()
+            log(f"livepurer channels fetched: {len(livepurer_entries)}")
+        except Exception as exc:
+            log(f"livepurer fetch failed; continuing without livepurer channels: {exc}")
+            livepurer_entries = []
+    merged = build_playlist(template_text, sources, fixed_text, updated_at, wudaliansai_text, livepurer_entries)
     if merged == current_text:
         log(f"M3U unchanged; upload skipped: {m3u_path}")
         return False
@@ -693,6 +751,7 @@ def watch(
     settle_seconds: int,
     fixed_check_interval_seconds: int = DEFAULT_FIXED_CHECK_INTERVAL_SECONDS,
     wudaliansai_check_interval_seconds: int = WUDALIANSAI_CHECK_INTERVAL_SECONDS,
+    livepurer_check_interval_seconds: int = LIVEPURER_CHECK_INTERVAL_SECONDS,
 ) -> None:
     last_mtime = db_path.stat().st_mtime if db_path.exists() else None
     last_fixed_hash: Optional[str] = None
@@ -702,6 +761,8 @@ def watch(
     current_wudaliansai_text: str = ""
     wudaliansai_pending_upload = False
     wudaliansai_last_change: Optional[dt.datetime] = None
+    last_livepurer_hash: Optional[str] = None
+    last_livepurer_check: Optional[dt.datetime] = None
     log(f"watching db={db_path}, m3u={m3u_path}, template={template_path}, interval={interval_seconds}s")
     try:
         try:
@@ -717,6 +778,13 @@ def watch(
             log("wudaliansai source baseline loaded")
         except Exception as exc:
             log(f"wudaliansai source baseline check skipped: {exc}")
+        try:
+            livepurer_entries = fetch_livepurer_channels()
+            last_livepurer_hash = content_hash(json.dumps([e.url for e in livepurer_entries]))
+            last_livepurer_check = now()
+            log(f"livepurer baseline loaded: {len(livepurer_entries)} channels")
+        except Exception as exc:
+            log(f"livepurer baseline check skipped: {exc}")
         run_once(db_path, m3u_path, template_path, wudaliansai_text=current_wudaliansai_text)
     except Exception as exc:
         log(f"startup update failed; original M3U preserved: {exc}")
@@ -776,6 +844,19 @@ def watch(
                     log(f"wudaliansai delayed upload failed: {exc}")
                 wudaliansai_pending_upload = False
                 wudaliansai_last_change = None
+        if is_fixed_check_due(current_time, last_livepurer_check, livepurer_check_interval_seconds):
+            try:
+                livepurer_entries = fetch_livepurer_channels()
+                livepurer_hash = content_hash(json.dumps([e.url for e in livepurer_entries]))
+                last_livepurer_check = current_time
+                if last_livepurer_hash is None:
+                    last_livepurer_hash = livepurer_hash
+                elif livepurer_hash != last_livepurer_hash:
+                    log("livepurer channels changed; updating M3U")
+                    run_once(db_path, m3u_path, template_path, wudaliansai_text=current_wudaliansai_text, livepurer_entries=livepurer_entries)
+                    last_livepurer_hash = livepurer_hash
+            except Exception as exc:
+                log(f"livepurer check skipped: {exc}")
 
 
 def parse_args() -> argparse.Namespace:
